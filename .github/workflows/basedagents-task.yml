@@ -1,0 +1,162 @@
+name: Publish labeled issues to BasedAgents
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number in this repository
+        type: string
+        required: true
+      dry_run:
+        description: Preview only; do not post or comment
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+# Serialize label events and manual reruns for the same issue.
+concurrency:
+  group: basedagents-${{ github.repository }}-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'bounty'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Build and optionally publish the task
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          BASEDAGENTS_KEYPAIR: ${{ secrets.BASEDAGENTS_KEYPAIR }}
+          BASEDAGENTS_DRY_RUN: ${{ vars.BASEDAGENTS_DRY_RUN }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+          DISPATCH_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const os = require('node:os');
+            const path = require('node:path');
+            const enabled = value => String(value).trim().toLowerCase() === 'true';
+            const dryRun = enabled(process.env.BASEDAGENTS_DRY_RUN) ||
+              (context.eventName === 'workflow_dispatch' && enabled(process.env.DISPATCH_DRY_RUN));
+            const rawNumber = context.eventName === 'workflow_dispatch'
+              ? process.env.DISPATCH_ISSUE_NUMBER : String(context.payload.issue.number);
+            if (!/^[1-9]\d*$/.test(rawNumber) || !Number.isSafeInteger(Number(rawNumber))) {
+              throw new Error('issue_number must be a positive integer.');
+            }
+            const target = { ...context.repo, issue_number: Number(rawNumber) };
+            // Fetch live labels: queued jobs must see a previous job's posted marker.
+            const { data: issue } = await github.rest.issues.get(target);
+            if (issue.pull_request) throw new Error('Only issues are supported, not pull requests.');
+            const labels = issue.labels.map(label => typeof label === 'string' ? label : label.name);
+            if (labels.includes('bounty:posted')) {
+              core.info('Skipped: bounty:posted is already present.');
+              return;
+            }
+            if (!labels.includes('bounty')) {
+              core.info('Skipped: the issue no longer has the bounty label.');
+              return;
+            }
+            const allowed = new Set(['code', 'research', 'data', 'content', 'automation']);
+            const categories = labels.filter(label => label.startsWith('bounty:'))
+              .map(label => label.slice(7)).filter(category => allowed.has(category));
+            if (new Set(categories).size > 1) {
+              throw new Error('Keep only one category label: bounty:code, bounty:research, bounty:data, bounty:content or bounty:automation.');
+            }
+            // Keep UTF-16 strings within API limits without splitting an emoji.
+            const clip = (value, limit) => {
+              let result = String(value || '').slice(0, limit);
+              const last = result.charCodeAt(result.length - 1);
+              if (last >= 0xD800 && last <= 0xDBFF) result = result.slice(0, -1);
+              return result;
+            };
+            const source = '\n\nSource: ' + issue.html_url;
+            const task = {
+              title: clip(issue.title, 200),
+              description: clip(issue.body, 10000 - source.length) + source,
+              category: categories[0] || 'code',
+              output_format: 'json'
+            };
+            if (dryRun) {
+              // JSON escapes embedded newlines so issue text cannot inject log commands.
+              core.info('DRY RUN: no BasedAgents request, comments, or label changes.');
+              core.info(JSON.stringify(task));
+              return;
+            }
+
+            const addPostedLabel = async () => {
+              try {
+                await github.rest.issues.getLabel({ ...context.repo, name: 'bounty:posted' });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                try {
+                  await github.rest.issues.createLabel({ ...context.repo, name: 'bounty:posted', color: '0e8a16' });
+                } catch (creationError) {
+                  if (creationError.status !== 422) throw creationError;
+                }
+              }
+              await github.rest.issues.addLabels({ ...target, labels: ['bounty:posted'] });
+            };
+            // Recover when posting/commenting succeeded but adding the label failed.
+            const comments = await github.paginate(github.rest.issues.listComments, { ...target, per_page: 100 });
+            const prior = comments.find(comment =>
+              comment.user?.login === 'github-actions[bot]' &&
+              /<!-- basedagents-task:v1 task_[A-Za-z0-9_-]+ -->/.test(comment.body || ''));
+            if (prior) {
+              await addPostedLabel();
+              core.info('Recovered the posted label from the existing bot comment; no new task.');
+              return;
+            }
+            const secret = process.env.BASEDAGENTS_KEYPAIR;
+            if (!secret) throw new Error('Set the BASEDAGENTS_KEYPAIR repository secret before publishing.');
+            core.setSecret(secret);
+            let key;
+            try { key = JSON.parse(secret); } catch { throw new Error('BASEDAGENTS_KEYPAIR must contain valid keypair JSON.'); }
+            // Mask raw fields too, including if the repository uses pretty-printed JSON.
+            for (const value of Object.values(key)) if (typeof value === 'string') core.setSecret(value);
+            const sdkDir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'basedagents-'));
+            const keyFile = path.join(sdkDir, 'agent-keypair.json');
+            const taskFile = path.join(sdkDir, 'task.json');
+            try {
+              await exec.exec('npm', ['install', '--prefix', sdkDir, '--ignore-scripts', '--no-audit', '--no-fund', 'basedagents@0.10.1'], { silent: true });
+              fs.writeFileSync(keyFile, secret, { mode: 0o600, flag: 'wx' });
+              fs.writeFileSync(taskFile, JSON.stringify(task), { mode: 0o600, flag: 'wx' });
+              // A constant SDK bridge reads JSON files; issue text is never code or CLI flags.
+              const bridge = `
+                import fs from 'node:fs';
+                import path from 'node:path';
+                import { pathToFileURL } from 'node:url';
+                const entry = path.join(process.env.BASEDAGENTS_SDK_DIR, 'node_modules', 'basedagents', 'dist', 'index.js');
+                const { RegistryClient, deserializeKeypair } = await import(pathToFileURL(entry).href);
+                const key = deserializeKeypair(fs.readFileSync(process.env.BASEDAGENTS_KEYPAIR_PATH, 'utf8'));
+                const task = JSON.parse(fs.readFileSync(process.env.BASEDAGENTS_TASK_PATH, 'utf8'));
+                if ('bounty' in task || 'escrow' in task) throw new Error('Only free tasks are permitted.');
+                const result = await new RegistryClient('https://api.basedagents.ai').createTask(key, task);
+                console.log(JSON.stringify(result));
+              `;
+              const posted = await exec.getExecOutput(process.execPath, ['--input-type=module', '-e', bridge], {
+                silent: true,
+                env: { ...process.env, BASEDAGENTS_SDK_DIR: sdkDir,
+                  BASEDAGENTS_KEYPAIR_PATH: keyFile, BASEDAGENTS_TASK_PATH: taskFile }
+              });
+              const result = JSON.parse(posted.stdout);
+              if (!/^task_[A-Za-z0-9_-]+$/.test(result.task_id || '')) throw new Error('BasedAgents returned no valid task ID.');
+              const taskUrl = 'https://basedagents.ai/tasks/' + result.task_id;
+              // The ID is a recovery checkpoint if commenting or labeling fails.
+              core.info('Created task: ' + taskUrl);
+              try {
+                await github.rest.issues.createComment({ ...target,
+                  body: '<!-- basedagents-task:v1 ' + result.task_id + ' -->\nBasedAgents task: ' + taskUrl });
+              } catch {
+                throw new Error('Task was created but the issue comment failed. Do not rerun until you copy the logged task URL to an issue comment and add bounty:posted.');
+              }
+              await addPostedLabel();
+            } finally {
+              fs.rmSync(keyFile, { force: true });
+              fs.rmSync(taskFile, { force: true });
+            }
