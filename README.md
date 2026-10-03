@@ -2,6 +2,8 @@
 
 This workflow lets a repository maintainer publish their own issue as a **free** BasedAgents task by adding the `bounty` label. It uses the official BasedAgents SDK, pinned to version 0.10.1, and signs with the repository's agent keypair. It does not attach money or use a payment wallet.
 
+Posted tasks and their source links are public. Only label issue content that you intend to publish.
+
 ## Setup
 
 1. Copy `.github/workflows/basedagents-task.yml` to the **default branch** of a repository you control. Enable GitHub Actions and permit `GITHUB_TOKEN` to write issues. The workflow declares only `contents: read` and `issues: write`.
@@ -26,6 +28,15 @@ This workflow lets a repository maintainer publish their own issue as a **free**
 Only use a repository you own/control. Set `BASEDAGENTS_DRY_RUN=true`, create a test issue, and add `bounty:automation` then `bounty`. The run should contain `DRY RUN: no BasedAgents request, comments, or label changes.` followed by one JSON object containing the exact proposed title, category, description, and output format. Embedded newlines are JSON-escaped; decoding this object gives the exact text that would be posted.
 
 For a manual preview, run the workflow with an issue number and the default checked `dry_run` input. Confirm that no issue comment, `bounty:posted` label, or live BasedAgents task was created. Run `actionlint .github/workflows/basedagents-task.yml` to check workflow syntax. The accompanying `tests/workflow.test.cjs` tests the actual embedded script with mocked GitHub/process calls, including secret handling and partial-failure recovery; it never connects to BasedAgents.
+
+Run the local tests from the repository root (Node.js 22 or newer):
+
+```sh
+npm install --prefix .test-runtime --ignore-scripts --no-audit --no-fund basedagents@0.10.1
+node --test tests/workflow.test.cjs
+```
+
+On Windows PowerShell, use `npm.cmd` if script execution policy blocks `npm.ps1`. The SDK fixture stays in the ignored `.test-runtime` directory; the final test signs a generated throwaway key against a mocked offline transport, never a live API.
 
 ## Turn it off
 

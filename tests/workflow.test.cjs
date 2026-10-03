@@ -6,7 +6,7 @@ const { spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 
 // Exercise the shipped workflow script itself; there is no duplicate implementation.
-const yaml = fs.readFileSync(path.join(__dirname, '../.github/workflows/basedagents-task.yml'), 'utf8');
+const yaml = fs.readFileSync(path.join(__dirname, '../.github/workflows/basedagents-task.yml'), 'utf8').replace(/\r\n/g, '\n');
 const script = yaml.split('          script: |\n')[1].split('\n')
   .map(line => line.slice(12)).join('\n');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
@@ -167,9 +167,9 @@ test('comment failure records the real task URL and requires manual recovery', a
   assert(h.logs.some(log => log.includes('/tasks/task_test123'))); assert.equal(count(h, 'addLabels'), 0); assert.equal(h.files.size, 0);
 });
 test('the exact SDK bridge signs a free task with official 0.10.1 SDK and an offline transport', async () => {
-  const sdkRoot = path.resolve(__dirname, '../../runtime');
+  const sdkRoot = process.env.BASEDAGENTS_TEST_SDK_DIR || path.resolve(__dirname, '../.test-runtime');
   if (!fs.existsSync(path.join(sdkRoot, 'node_modules/basedagents/dist/index.js'))) {
-    throw new Error('Install SDK fixture first: npm install --prefix ../runtime --ignore-scripts basedagents@0.10.1');
+    throw new Error('Install SDK fixture first: npm install --prefix .test-runtime --ignore-scripts basedagents@0.10.1');
   }
   const sdk = await import(pathToFileURL(path.join(sdkRoot, 'node_modules/basedagents/dist/index.js')).href);
   const h = harness({ dry: false }); await h.execute();
